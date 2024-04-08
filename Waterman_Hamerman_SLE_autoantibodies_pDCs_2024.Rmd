@@ -1,0 +1,36 @@
+---
+title: "Analysis of autoantigen microarray and RNA-seq data included in Waterman et al. 2024, `Lupus IgA1 autoantibodies synergize with IgG to enhance pDC responses to RNA-containing immune complexes`"
+author: "Matt Dufort"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 5
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+<style type="text/css">
+body{ /* Normal  */
+      font-size: 14px;
+  }
+h1 { /* Header 1 */
+  font-size: 28px;
+}
+h2 { /* Header 2 */
+    font-size: 24px;
+}
+h3 { /* Header 3 */
+  font-size: 20px;
+}
+h4 { /* Header 4 */
+  font-size: 16px;
+}
+</style>
+
+# Project Summary
+
+This script analyses data from SLE patients and healthy controls. The data include autoantigen microarrays, levels of some flow populations and markers of particular interest (especially FcaR and FcgRII on D6 pDCs), and whole blood RNA-sequencing data (RNA-seq).
+
+This file is a temporary placeholder, to be replaced with fully functional code in the near future.
