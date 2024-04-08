@@ -33,4 +33,910 @@ h4 { /* Header 4 */
 
 This script analyses data from SLE patients and healthy controls. The data include autoantigen microarrays, levels of some flow populations and markers of particular interest (especially FcaR and FcgRII on D6 pDCs), and whole blood RNA-sequencing data (RNA-seq).
 
-This file is a temporary placeholder, to be replaced with fully functional code in the near future.
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+# load widely used packages
+if (!require(knitr)) install.packages("knitr"); library(knitr)
+if (!require(kableExtra)) install.packages("kableExtra"); library(kableExtra)
+if (!require(tidyverse)) install.packages("tidyverse"); library(tidyverse)
+if (!require(magrittr)) install.packages("magrittr"); library(magrittr)
+
+# load (and install) custom packages
+if (!require(devtools)) install.packages("devtools")
+if (!require(annotables)) devtools::install_github("stephenturner/annotables"); library(annotables)
+if (!require(RNAseQC)) devtools::install_github("benaroyaresearch/RNAseQC"); library(RNAseQC)
+if (!require(geneSetTools)) devtools::install_github("benaroyaresearch/geneSetTools"); library(geneSetTools)
+if (!require(miscHelpers)) devtools::install_github("benaroyaresearch/miscHelpers"); library(miscHelpers)
+
+# load packages for RNAseq analyses
+library(data.table)
+if (!require(BiocManager)) install.packages("BiocManager")
+if (!require(limma)) BiocManager::install("limma"); library(limma)
+if (!require(edgeR)) BiocManager::install("edgeR"); library(edgeR)
+if (!require(ComplexHeatmap)) BiocManager::install("ComplexHeatmap"); library(ComplexHeatmap)
+if (!require(GEOquery)) BiocManager::install("GEOquery"); library(GEOquery)
+
+# load Prism theme
+if (!require(ggprism)) install.packages("ggprism"); library(ggprism)
+
+# set plot theme
+theme_set(
+  theme_bw(20) +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 1),
+      axis.text = element_text(colour = "black"),
+      axis.ticks = element_line(colour = "black"),
+      legend.key = element_blank(),
+      text = element_text(size = 12),
+      strip.text.x = element_text(size = 10, margin = margin(b = 4, t = 2) ),
+      strip.background = element_rect(fill = "white", color = "black")))
+
+# set up knitr options
+opts_chunk$set(
+  fig.width = 2, fig.height = 1.5,
+  cache = TRUE, echo = FALSE, warning = FALSE, message = FALSE)
+options(stringsAsFactors = FALSE)
+```
+
+```{r setupDirectories}
+# Set up directories
+dirBase <- file.path("~", "Library", "CloudStorage", "Box-Box") # update this as needed
+dirRoot <- file.path(dirBase, "Projects", "Waterman_Hamerman_SLE_autoantibodies_pDCs_2024") # update this as needed
+dirData <- file.path(dirRoot, "data")
+dirPlots <- file.path(dirRoot, "plots")
+dirTables <- file.path(dirRoot, "tables")
+
+filenameSuffix <- "Waterman_Hamerman_SLE_autoantibodies_pDCs_2024"
+```
+
+```{r setWorkingDirectory}
+opts_knit$set(root.dir = dirRoot)
+setwd(dirRoot)
+```
+
+# Load flow data
+
+```{r loadFlowData, dependson="setupDirectories"}
+# load primary flow data sheet
+dataFlow <-
+  read.csv(file.path(dirData, "dataFlow.csv"))
+```
+
+# Load antigen array Ig data with normalized signal intensity (NSI) for IgA and IgG
+
+Next we load and clean the antigen array Ig data.
+
+```{r loadDataArrayIgNormalizedNsi, dependson=c("setupDirectories", "define_function_clean_utsw_data")}
+arrayIgNormalizedNsi <-
+  read.csv(file.path(dirData,"arrayIgNormalizedNsi.csv")) %>%
+  rename(sledaiScore = SLEDAI.score) %>%
+  mutate(
+    donorId = donorId %>%
+      as.character() %>%
+      factor(levels = str_sort(unique(.), numeric = TRUE)))
+```
+
+# Load RNAseq data
+
+Our next step is to load, clean, and normalize the RNAseq data. 
+
+```{r loadRnaseqAnnotationFromGeo, results="hide", message=FALSE, warning=FALSE}
+# read in annotation from GEO, and standardize and match column names
+geoRepository <- "GSE242721"
+geoData <- getGEO(geoRepository)
+
+# load RNAseq annotation
+rnaseqAnnotation <-
+  geoData[[paste0(geoRepository, "_series_matrix.txt.gz")]]@phenoData@data %>%
+  tibble::rownames_to_column("gsId") %>%
+  select(
+    gsId,
+    libid = title,
+    diseaseStatus = `disease status:ch1`,
+    donorId = `donorid:ch1`,
+    sex = `Sex:ch1`,
+    normGmfiMerged = `normalized fcar gmfi on pdcs:ch1`,
+    sledaiScore = `sledai score:ch1`) %>%
+  # split normGmfiMerged into 4 columns based on semicolon
+  tidyr::separate(
+    normGmfiMerged,
+    into = c("normFcarGmfiPdcs", "normFcgriiGmfiPdcs",
+             "normFcarGmfiMonocytes", "normFcgriiGmfiMonocytes"),
+    sep = ";") %>%
+  mutate(
+    # convert sledaiScore and flow gMFIs to numeric
+    across(.cols = c(sledaiScore, normFcarGmfiPdcs, normFcgriiGmfiPdcs,
+                     normFcarGmfiMonocytes, normFcgriiGmfiMonocytes),
+           .fns = as.numeric),
+    # extract batch variable for downstream use
+    batch =
+      case_when(as.numeric(str_extract(libid, "\\d+")) < 60000 ~ "batch1",
+                as.numeric(str_extract(libid, "\\d+")) > 60000 ~ "batch2") %>%
+      factor(levels = c("batch1", "batch2")))
+```
+
+```{r loadCountsFromGeo, dependson="loadRnaseqAnnotationFromGeo", results="hide", message=FALSE, warning=FALSE}
+## download counts from GEO, read them in
+getGEOSuppFiles(geoRepository)
+filenameCounts <-
+  file.path(
+    geoRepository,
+    "GSE242721_P379_combined_counts_GEO.csv.gz")
+countsRaw <-
+  readr::read_csv(filenameCounts) %>%
+  dplyr::rename(gene = `...1`)
+```
+
+## Filter and normalize gene counts
+
+```{r defineFunctionsFilterGenesNormalizeCounts}
+#Define a function to filter out lowly expressed genes
+filterGenes <-
+  function(counts, 
+           minLibPerc = 0.1,
+           minCpm = 1){
+    # Keep genes with cpm of at least minCpm in at least minLibPerc fraction of libraries
+    # CPM normalize
+    countsCpm <- as.data.frame(t(t(counts*10^6)/colSums(counts)))
+    
+    # Filter out lowly expressed genes
+    keepRows <- rowSums((countsCpm) >= minCpm) >= minLibPerc*ncol(countsCpm)
+    countsFiltered <- counts[keepRows,]
+    
+    return(countsFiltered)
+  }
+
+normalizeGeneCounts <- function(counts, method){
+  # normalize using tmm or deconvolution
+  # tmm is good for bulk RNAseq
+  # deconvolution is best for large datasets of single cell RNAseq
+  # deconvolution is NOT recommended for smaller datasets (less than a few hundred cells)
+
+  if (method == "tmm"){
+    # Normalize using the TMM algorithm 
+    dge <- DGEList(counts)
+    dge <- calcNormFactors(dge)
+    countsNorm <- cpm(dge, normalized.lib.sizes=TRUE)
+  } else stop(paste0("Method ", method, " not recognized. Only `tmm` is supported."))
+  
+  return(countsNorm)
+}
+```
+
+```{r filterNormalizeGeneCounts, dependson=c("loadCountsFromGeo", "defineFunctionsFilterGenesNormalizeCounts")}
+## Keep protein coding genes with HGNC symbols, and drop non-protein-coding genes
+counts.tmp <-
+  countsRaw %>%
+  as.data.frame() %>%
+  mutate(gene = get_HGNC(gene, type = "protein_coding")) %>%
+  dplyr::filter(!is.na(gene)) %>%
+  as.data.table()
+
+## use data.table to aggregate/sum counts for duplicated HGNC symbols (way faster than stats::aggregate)
+# this also drops rows with HGNC.symbols==NA, which should include any genes not in the specified types
+countsPc <-
+  counts.tmp[
+    , lapply(.SD, sum), by = gene, 
+    .SDcols = grep("^lib", colnames(counts.tmp), value=TRUE)] %>%
+  arrange(gene) %>%
+  as.data.frame() %>%
+  magrittr::set_rownames(., value = .$gene)
+  
+countsPc <- countsPc[, -which(colnames(countsPc) == "gene")]
+
+## filter lowly expressed genes
+countsPcFiltered <- filterGenes(countsPc, 0.10, 1)
+
+countsPcNorm <- normalizeGeneCounts(countsPcFiltered, "tmm")
+
+## correct for batch effect due to sequencing done in two batches
+# while accounting for normFcarGmfiPdcs
+libidOrder.tmp <-
+  rnaseqAnnotation$libid[!is.na(rnaseqAnnotation$normFcarGmfiPdcs)]
+log2CountsPcNormBatchCorrected <-
+  countsPcNorm[, match(libidOrder.tmp, colnames(countsPcNorm))] %>%
+  voom() %>%
+  removeBatchEffect(
+    batch = rnaseqAnnotation$project[match(libidOrder.tmp, rnaseqAnnotation$libid)],
+    design =
+      model.matrix(
+        ~ normFcarGmfiPdcs,
+        data = rnaseqAnnotation[match(libidOrder.tmp, rnaseqAnnotation$libid),]))
+
+rm_tmp(ask = FALSE)
+```
+
+A filter is applied to select protein coding genes with HGNC symbols. Genes with very low very low expression across all libraries are removed as these genes will not be informative in downstream analysis. This filter selects genes with a count of at least one per million reads in 10% of libraries. This results `r nrow(countsPcNorm)` genes. The filtered genes are normalized using the TMM (trimmed mean of M values) algorithm.
+
+
+# Set up color palettes
+
+```{r setupPalettes, dependson="loadRnaseqAnnotationFromGeo"}
+if (!require(circlize)) install.packages("circlize"); library(circlize)
+colorRampSledaiScore <-
+  colorRamp2(c(0, max(rnaseqAnnotation$sledaiScore, na.rm = T)), c("#FFFFFF", "deeppink3"))
+
+colorRampFcarGMfiD6Pdcs <-
+  colorRamp2(c(0, max(rnaseqAnnotation$normFcarGmfiPdcs, na.rm = T)), c("#FFFFFF", "#d0214c"))
+
+colorRampFcgrIIGMfiD6Pdcs <-
+  colorRamp2(c(0, max(rnaseqAnnotation$normFcgriiGmfiPdcs, na.rm = T)), c("#FFFFFF", "#4c649c"))
+
+colorRampCorrelations <-
+  colorRamp2(breaks = seq(-1, 1, length.out = 9), colors = rev(RColorBrewer::brewer.pal(9, "RdBu")))
+```
+
+# Load gene sets
+
+In some downstream analyses, we will use sets of genes previously identified in relation to different biological processes. We load those gene sets now.
+
+```{r loadGeneSets}
+if (!require(msigdbr)) install.packages("msigdbr"); library(msigdbr)
+geneSetHallmarkIfna <-
+  msigdbr::msigdbr(species = "Homo sapiens", category = "H") %>%
+  dplyr::filter(gs_name == "HALLMARK_INTERFERON_ALPHA_RESPONSE") %>%
+  dplyr::pull(human_gene_symbol) %>%
+  unique()
+```
+
+# Calculate gene set expression
+
+As an overall measure of gene set expression, we use the median log expression of the set of genes, for each sample.
+
+```{r calculateGeneSetScores, dependson=c("filterNormalizeGeneCounts", "loadGeneSets")}
+rnaseqAnnotation$geneSetMedianHallmarkIfna <-
+  geneSetTools::gene_set_median_count(
+    gene_set = geneSetHallmarkIfna,
+    counts =
+      log2CountsPcNormBatchCorrected[
+        , match(rnaseqAnnotation$libid, colnames(log2CountsPcNormBatchCorrected))])
+```
+
+## Plot and test gene set expression vs FcaR gMFI D6 pDCs
+
+### Plot and test Hallmark IFNa response gene set expression vs FcaR gMFI D6 pDCs
+
+```{r plotGeneSetMedianHallmarkIfnaVsNormFcarGmfiPdcs, dependson="calculateGeneSetScores"}
+# manuscript Figure 7D
+plot.tmp <-
+  ggplot(
+    rnaseqAnnotation,
+    mapping =
+      aes(x = normFcarGmfiPdcs, y = geneSetMedianHallmarkIfna)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = FALSE, linetype="dashed", color = "black") +
+  labs(
+    x = "Normalized FcaR gMFI on D6 pDCs",
+    y = "Hallmark IFNa response gene set\n(median log expression)") +
+  ggprism::theme_prism()
+
+filename.tmp <-
+  file.path(
+    dirPlots,
+    paste0("plotGeneSetMedianHallmarkIfnaVsNormFcarGmfiPdcs.",
+           filenameSuffix, ".pdf"))
+pdf(filename.tmp, w = 5.3, h = 5)
+print(plot.tmp)
+invisible(dev.off())
+
+rm_tmp(ask = FALSE)
+```
+
+```{r corTestGeneSetMedianHallmarkIfnaVsNormFcarGmfiPdcs, dependson=c("calculateGeneSetScores", "loadRnaseqAnnotationFromGeo")}
+data.tmp <-
+  rnaseqAnnotation %>%
+  dplyr::filter(!is.na(normFcarGmfiPdcs))
+corTestGeneSetMedianHallmarkIfnaVsNormFcarGmfiPdcs <-
+  cor.test(
+    data.tmp$normFcarGmfiPdcs,
+    data.tmp$geneSetMedianHallmarkIfna, 
+    use = "pairwise")
+
+rm_tmp(ask = FALSE)
+```
+
+### Plot and test Hallmark IFNa response gene set expression vs FcgRII gMFI D6 pDCs
+
+```{r plotGeneSetMedianHallmarkIfnaVsNormFcgriiGmfiPdcs, dependson="calculateGeneSetScores"}
+# manuscript Figure S8B
+plot.tmp <-
+  ggplot(
+    rnaseqAnnotation %>% 
+      dplyr::filter(!is.na(normFcgriiGmfiPdcs)),
+    mapping =
+      aes(x = normFcgriiGmfiPdcs, y = geneSetMedianHallmarkIfna)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = FALSE, linetype="dashed", color = "black") +
+  labs(
+    x = "Normalized FcgRII gMFI on D6 pDCs",
+    y = "Hallmark IFNa response gene set\n(median log expression)") +
+  ggprism::theme_prism()
+
+filename.tmp <-
+  file.path(
+    dirPlots,
+    paste0("plotGeneSetMedianHallmarkIfnaVsNormFcgriiGmfiPdcs.",
+           filenameSuffix, ".pdf"))
+pdf(filename.tmp, w = 5.3, h = 5)
+print(plot.tmp)
+invisible(dev.off())
+
+rm_tmp(ask = FALSE)
+```
+
+```{r corTestGeneSetMedianHallmarkIfnaVsNormFcgriiGmfiPdcs, dependson=c("calculateGeneSetScores", "loadRnaseqAnnotationFromGeo")}
+# manuscript Figure S8B
+data.tmp <-
+  rnaseqAnnotation %>%
+  dplyr::filter(!is.na(normFcgriiGmfiPdcs))
+corTestGeneSetMedianHallmarkIfnaVsNormFcgriiGmfiPdcs <-
+  cor.test(
+    data.tmp$normFcgriiGmfiPdcs,
+    data.tmp$geneSetMedianHallmarkIfna, 
+    use = "pairwise")
+
+rm_tmp(ask = FALSE)
+```
+
+### Plot and test Hallmark IFNa response gene set expression vs FcaR gMFI on monocytes (CD16-CD14+)
+
+```{r plotGeneSetMedianHallmarkIfnaVsNormFcarGmfiMonocytes, dependson="calculateGeneSetScores"}
+# manuscript Figure S8C1
+plot.tmp <-
+  ggplot(
+    rnaseqAnnotation %>% 
+      dplyr::filter(!is.na(normFcarGmfiMonocytes)),
+    mapping =
+      aes(x = normFcarGmfiMonocytes, y = geneSetMedianHallmarkIfna)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = FALSE, linetype="dashed", color = "black") +
+  labs(
+    x = "Normalized FcaR gMFI on CD14+ CD16- monocytes",
+    y = "Hallmark IFNa response gene set\n(median log expression)") +
+  ggprism::theme_prism()
+
+filename.tmp <-
+  file.path(
+    dirPlots,
+    paste0("plotGeneSetMedianHallmarkIfnaVsNormFcarGmfiMonocytes.",
+           filenameSuffix, ".pdf"))
+pdf(filename.tmp, w = 5.3, h = 5)
+print(plot.tmp)
+invisible(dev.off())
+
+rm_tmp(ask = FALSE)
+```
+
+```{r corTestGeneSetMedianHallmarkIfnaVsNormFcarGmfiMonocytes, dependson=c("calculateGeneSetScores", "loadRnaseqAnnotationFromGeo")}
+# manuscript Figure S8C1
+data.tmp <-
+  rnaseqAnnotation %>%
+  dplyr::filter(!is.na(normFcarGmfiMonocytes))
+corTestGeneSetMedianHallmarkIfnaVsNormFcarGmfiMonocytes <-
+  cor.test(
+    data.tmp$normFcarGmfiMonocytes,
+    data.tmp$geneSetMedianHallmarkIfna,
+    use = "pairwise")
+
+rm_tmp(ask = FALSE)
+```
+
+### Plot and test Hallmark IFNa response gene set expression vs FcgRII gMFI on monocytes (CD16-CD14+)
+
+```{r plotGeneSetMedianHallmarkIfnaVsNormFcgriiGmfiMonocytes, dependson="calculateGeneSetScores"}
+# manuscript Figure S8C2
+plot.tmp <-
+  ggplot(
+    rnaseqAnnotation %>% 
+      dplyr::filter(!is.na(normFcgriiGmfiMonocytes)),
+    mapping =
+      aes(x = normFcgriiGmfiMonocytes, y = geneSetMedianHallmarkIfna)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = FALSE, linetype="dashed", color = "black") +
+  labs(
+    x = "Normalized FcgRII gMFI on CD14+ CD16- monocytes",
+    y = "Hallmark IFNa response gene set\n(median log expression)") +
+  ggprism::theme_prism()
+
+filename.tmp <-
+  file.path(
+    dirPlots,
+    paste0("plotGeneSetMedianHallmarkIfnaVsNormFcgriiGmfiMonocytes.",
+           filenameSuffix, ".pdf"))
+pdf(filename.tmp, w = 5.3, h = 5)
+print(plot.tmp)
+invisible(dev.off())
+
+rm_tmp(ask = FALSE)
+```
+
+```{r corTestGeneSetMedianHallmarkIfnaVsNormFcgriiGmfiMonocytes, dependson=c("calculateGeneSetScores", "loadRnaseqAnnotationFromGeo")}
+# manuscript Figure S8C2
+data.tmp <-
+  rnaseqAnnotation %>%
+  dplyr::filter(!is.na(normFcgriiGmfiMonocytes))
+corTestGeneSetMedianHallmarkIfnaVsNormFcgriiGmfiMonocytes <-
+  cor.test(
+    data.tmp$normFcgriiGmfiMonocytes,
+    data.tmp$geneSetMedianHallmarkIfna, 
+    use = "pairwise")
+
+rm_tmp(ask = FALSE)
+```
+
+# Differential gene expression with FcaR gMFI on D6 pDCs
+
+Gene expression was modeled as a function of "Norm FcaR gMFI D6 pDCs" measurements.
+
+```{r limmaFcarPdcs, dependson=c("loadRnaseqAnnotationFromGeo", "filterNormalizeGeneCounts")}
+designFcarPdcs <-
+  rnaseqAnnotation %>%
+  dplyr::filter(!is.na(normFcarGmfiPdcs))
+
+countsFcarPdcs <-
+  countsPcNorm[, match(designFcarPdcs$libid, colnames(countsPcNorm))]
+
+designMatFcarPdcs <-
+  model.matrix(
+    ~ normFcarGmfiPdcs + batch,
+    data = designFcarPdcs)
+
+# simplify columns names so contrasts are easier to make later
+colnames(designMatFcarPdcs) <- c("(Intercept)", "FcaR", "batch")
+
+vwtsFcarPdcs <-
+  voomWithQualityWeights(
+    countsFcarPdcs, design = designMatFcarPdcs, plot = F, span = 0.2)
+
+# fit model
+vfitFcarPdcs <-
+  lmFit(vwtsFcarPdcs) %>%
+  eBayes()
+
+topGenesFcarPdcs <-
+  vfitFcarPdcs %>%
+  topTable(coef = "FcaR", sort.by = "P", number = Inf) %>%
+  tibble::rownames_to_column(var = "gene")
+```
+
+## Heatmaps of genes differentially expressed with FcaR gMFI D6 pDCs, SLE subjects only
+
+```{r heatmapSetupFcarPdcs, dependson=c("limmaFcarPdcs", "setupPalettes")}
+# manuscript Figure S8A
+heatmapParamsFcarPdcs <- list()
+
+heatmapParamsFcarPdcs[["nGenesToPlot"]] <- 50
+heatmapParamsFcarPdcs[["genesToPlot"]] <- 
+  topGenesFcarPdcs %>%
+  dplyr::arrange(P.Value) %>%
+  dplyr::slice(1:heatmapParamsFcarPdcs[["nGenesToPlot"]]) %>%
+  dplyr::pull(gene)
+
+heatmapParamsFcarPdcs[["libraryOrder"]] <-
+  designFcarPdcs %>%
+  dplyr::arrange(normFcarGmfiPdcs) %>%
+  dplyr::pull(libid)
+
+heatmapParamsFcarPdcs[["counts"]] <-
+  vwtsFcarPdcs$E[
+    heatmapParamsFcarPdcs[["genesToPlot"]],
+    match(heatmapParamsFcarPdcs[["libraryOrder"]],
+          colnames(vwtsFcarPdcs))]
+
+heatmapParamsFcarPdcs[["scaledCounts"]] <-
+  t(scale(t(heatmapParamsFcarPdcs[["counts"]])))
+
+heatmapParamsFcarPdcs[["annotationCols"]] <- list()
+heatmapParamsFcarPdcs[["annotationCols"]][["sledaiScore"]] <- colorRampSledaiScore
+heatmapParamsFcarPdcs[["annotationCols"]][["normFcarGmfiPdcs"]] <-
+  colorRampFcarGMfiD6Pdcs
+heatmapParamsFcarPdcs[["annotationCols"]][["normFcgriiGmfiPdcs"]] <-
+  colorRampFcgrIIGMfiD6Pdcs
+
+heatmapParamsFcarPdcs[["columnAnno"]] <-
+  HeatmapAnnotation(
+    df =
+      designFcarPdcs[
+        match(heatmapParamsFcarPdcs[["libraryOrder"]],
+              designFcarPdcs$libid),] %>%
+      dplyr::select(
+        FcaR_gMFI_pDCs = normFcarGmfiPdcs,
+        sledaiScore
+      ),
+    col = 
+      list(
+        FcaR_gMFI_pDCs =
+          heatmapParamsFcarPdcs[["annotationCols"]][["normFcarGmfiPdcs"]],
+        FcgRII_gMFI_pDCs =
+          heatmapParamsFcarPdcs[["annotationCols"]][["normFcgriiGmfiPdcs"]],
+        sledaiScore =
+          heatmapParamsFcarPdcs[["annotationCols"]][["sledaiScore"]]
+      )
+  )
+```
+
+We arrange the samples by FcaR gMFI on D6 pDCs, include FcaR and FcgRII levels and SLEDAI scores, and label genes as being in the Hallmark IFNa response set by having an * at the end of the gene name.
+
+```{r heatmapSortedFcarPdcsMarkGeneSetHallmarkIfna, dependson="heatmapSetupFcarPdcs"}
+# manuscript Figure S8A
+heatmapParamsFcarPdcs[["columnAnnoIncFcarFcgRIISledai"]] <-
+  HeatmapAnnotation(
+    df =
+      designFcarPdcs[
+        match(heatmapParamsFcarPdcs[["libraryOrder"]],
+              designFcarPdcs$libid),] %>%
+      dplyr::select(
+        FcaR_gMFI_pDCs = normFcarGmfiPdcs,
+        FcgRII_gMFI_pDCs = normFcgriiGmfiPdcs,
+        sledaiScore),
+    col = 
+      list(
+        FcaR_gMFI_pDCs =
+          heatmapParamsFcarPdcs[["annotationCols"]][["normFcarGmfiPdcs"]],
+        FcgRII_gMFI_pDCs =
+          heatmapParamsFcarPdcs[["annotationCols"]][["normFcgriiGmfiPdcs"]],
+        sledaiScore =
+          heatmapParamsFcarPdcs[["annotationCols"]][["sledaiScore"]])
+  )
+
+# set row labels with genes in Hallmark IFNa response set with an asterisk
+heatmapParamsFcarPdcs[["rowLabelsMarkHallmarkIfnaGenes"]] <-
+  heatmapParamsFcarPdcs[["genesToPlot"]]
+heatmapParamsFcarPdcs[["rowLabelsMarkHallmarkIfnaGenes"]][
+  heatmapParamsFcarPdcs[["rowLabelsMarkHallmarkIfnaGenes"]] %in% geneSetHallmarkIfna] <-
+  paste0(
+    heatmapParamsFcarPdcs[["rowLabelsMarkHallmarkIfnaGenes"]][
+      heatmapParamsFcarPdcs[["rowLabelsMarkHallmarkIfnaGenes"]] %in% geneSetHallmarkIfna],
+    "*")
+
+heatmapSortedFcarPdcsMarkGeneSetHallmarkIfna <-
+  Heatmap(
+    heatmapParamsFcarPdcs[["scaledCounts"]],
+    name = "row z-score",
+    cluster_columns = FALSE,
+    row_labels = heatmapParamsFcarPdcs[["rowLabelsMarkHallmarkIfnaGenes"]],
+    row_names_gp = gpar(fontsize = 8),
+    clustering_distance_columns = "manhattan",
+    clustering_distance_rows = "manhattan",
+    top_annotation = heatmapParamsFcarPdcs[["columnAnnoIncFcarFcgRIISledai"]],
+    show_column_names = FALSE,
+    show_row_names = TRUE)
+
+pdf(
+  file.path(
+    dirPlots, 
+    paste0("heatmapSortedFcarPdcsMarkGeneSetHallmarkIfna.",
+           filenameSuffix, ".pdf")),
+  width = 10, height = 9)
+print(heatmapSortedFcarPdcsMarkGeneSetHallmarkIfna)
+invisible(dev.off())
+```
+
+# UTSW Ig data exploration
+
+## Examine correlations between Ig levels of different isotypes, using normalized NSI values
+
+### Calculate correlations of log-transformed IgA and IgG for each antigen, using normalized NSI
+
+```{r calcCorrelationsLogIgaIggArrayIgNormalizedNsi, dependson="loadDataArrayIgNormalizedNsi"}
+# manuscript Figure 1B
+corMethod.tmp <- "pearson"
+
+correlationsLogIgaIggArrayIgNormalizedNsi <- numeric()
+for (antigen.tmp in unique(arrayIgNormalizedNsi$antigen)) {
+  data.tmp <-
+    arrayIgNormalizedNsi %>%
+    dplyr::filter(antigen %in% antigen.tmp)
+  correlationsLogIgaIggArrayIgNormalizedNsi[[antigen.tmp]] <-
+    cor(x = log1p(data.tmp$valueNormalizedNsiIgA),
+        y = log1p(data.tmp$valueNormalizedNsiIgG),
+        method = corMethod.tmp)
+}
+
+rm_tmp(ask = FALSE)
+```
+
+```{r testCorrelationsLogIgaIggArrayIgNormalizedNsi, dependson="loadDataArrayIgNormalizedNsi"}
+# manuscript Figure 1B
+corMethod.tmp <- "pearson"
+
+corTestLogIgaIggArrayIgNormalizedNsi <- list()
+for (antigen.tmp in unique(arrayIgNormalizedNsi$antigen)) {
+  data.tmp <-
+    arrayIgNormalizedNsi %>%
+    dplyr::filter(antigen %in% antigen.tmp)
+  corTestLogIgaIggArrayIgNormalizedNsi[[antigen.tmp]] <-
+    cor.test(
+      x = log1p(data.tmp$valueNormalizedNsiIgA),
+      y = log1p(data.tmp$valueNormalizedNsiIgG),
+      method = corMethod.tmp)
+}
+
+summaryCorTestLogIgaIggArrayIgNormalizedNsi <-
+  data.frame(
+    antigen = names(corTestLogIgaIggArrayIgNormalizedNsi),
+    correlation = unname(sapply(corTestLogIgaIggArrayIgNormalizedNsi, \(x) x$estimate)),
+    p.value = unname(sapply(corTestLogIgaIggArrayIgNormalizedNsi, \(x) x$p.value)))
+
+rm_tmp(ask = FALSE)
+```
+
+### Model and plot log-transformed IgA and IgG for each antigen, using normalized NSI
+
+```{r modelRmaLogIgaIggArrayIgNormalizedNsiEachAntigen, dependson="loadDataArrayIgNormalizedNsi"}
+# manuscript Figure 1B
+if (!require(lmodel2)) install.packages("lmodel2"); library(lmodel2)
+
+modelRmaLogIgaIggArrayIgNormalizedNsiEachAntigen <- list()
+
+for (antigen.tmp in unique(arrayIgNormalizedNsi$antigen)) {
+  data.tmp <-
+    arrayIgNormalizedNsi %>%
+    dplyr::filter(antigen %in% antigen.tmp)
+  
+  # generate standard major axis regression model (= reduced major axis regression model) for plotting
+  modelRmaLogIgaIggArrayIgNormalizedNsiEachAntigen[[antigen.tmp]] <-
+    lmodel2(log1p(valueNormalizedNsiIgG) ~ log1p(valueNormalizedNsiIgA), 
+            data = data.tmp,
+            range.y = "interval", range.x = "interval",
+            nperm = 0)
+  modelRmaLogIgaIggArrayIgNormalizedNsiEachAntigen[[antigen.tmp]] <-
+    modelRmaLogIgaIggArrayIgNormalizedNsiEachAntigen[[antigen.tmp]]$regression.results %>%
+    magrittr::set_colnames(c("method", "intercept", "slope", "angle", "p-value")) %>%
+    dplyr::filter(method == "RMA")
+}
+
+modelRmaLogIgaIggArrayIgNormalizedNsiEachAntigen <- 
+  bind_rows(modelRmaLogIgaIggArrayIgNormalizedNsiEachAntigen, .id = "antigen")
+
+rm_tmp(ask = FALSE)
+```
+
+#### Plot log-transformed IgA and IgG for each antigen
+
+```{r plotLogIgaIggArrayIgNormalizedNsiEachAntigen, dependson=c("modelLogIgaIggArrayIgNormalizedNsiEachAntigen", "calcCorrelationsIgaIggArrayIgNormalizedNsi", "loadDataArrayIgNormalizedNsi")}
+# manuscript Figure 1B
+# use log1p because valueNormalizedNsiIgA has a bunch of values at 0.001, which throw off the scale
+pdf(
+  file.path(
+    dirPlots, 
+    paste0("plotLogIgaIggArrayIgNormalizedNsiEachAntigen.",
+           filenameSuffix, ".pdf")),
+  w = 6, h = 6)
+
+for (antigen.tmp in unique(arrayIgNormalizedNsi$antigen)) {
+  data.tmp <-
+    arrayIgNormalizedNsi %>%
+    dplyr::filter(antigen %in% antigen.tmp)
+  xylims.tmp <-
+    data.tmp %>%
+    dplyr::select(valueNormalizedNsiIgA, valueNormalizedNsiIgG) %>%
+    unlist() %>%
+    log1p() %>%
+    range()
+  
+  plot.tmp <-
+    ggplot(
+      data.tmp,
+      mapping = aes(x = log1p(valueNormalizedNsiIgA), y = log1p(valueNormalizedNsiIgG))) +
+    geom_point(size = 3) +
+    geom_abline(
+      data =
+        modelRmaLogIgaIggArrayIgNormalizedNsiEachAntigen %>%
+        dplyr::filter(antigen == antigen.tmp), 
+      aes(intercept = intercept, slope = slope),
+      linewidth = 1, linetype = "dashed") +
+    lims(x = xylims.tmp, y = xylims.tmp) +
+    # geom_abline(slope = 1, intercept = 0, size = 0.5, linetype = "dotted") +
+    labs(x = "IgA (log normalized signal intensity)",
+         y = "IgG (log normalized signal intensity)",
+         title = 
+           paste0(antigen.tmp, ";  r = ",
+                  round(correlationsLogIgaIggArrayIgNormalizedNsi[[antigen.tmp]], 2))) +
+    ggprism::theme_prism()
+  
+  print(plot.tmp)
+}
+invisible(dev.off())
+
+rm_tmp(ask = FALSE)
+```
+
+# Heatmaps of SLE-associated autoantibodies, NSI values, for each Ig class, separate for RNA- and DNA-associated
+
+These heatmaps should include either the RNA- or DNA-associated antibodies. We will plot IgA and IgG together, and use the same scale for IgM and IgD (I think). And we want to include the healthy controls as a separate column, with the same row clustering.
+
+```{r heatmapSetupArrayIgNormalizedNsiSleAssociatedByClassAndCategory, dependson=c("loadDataArrayIgNormalizedNsi", "setupPalettes")}
+# include SLEDAI (colorRampSledaiScore)
+# split targets into separate heatmaps (DNA-associated, RNA-associated)
+heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory <- list()
+
+# select targets to plot
+heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["IgToPlot"]] <-
+  arrayIgNormalizedNsi %>%
+  dplyr::select(category, antigen) %>%
+  unique() %>%
+  mutate(
+    category =
+      str_remove(category, "\\-associated") %>%
+      factor(levels = c("DNA", "RNA"))) %>%
+  group_split(category) %>%
+  setNames(., unlist(lapply(., \(x) unique(x$category)))) %>%
+  lapply(dplyr::pull, antigen)
+
+# select and arrange samples to plot
+heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["sampleOrder"]] <-
+  arrayIgNormalizedNsi %>%
+  dplyr::arrange(as.numeric(donorId)) %>%
+  dplyr::pull(donorId) %>%
+  unique()
+
+# extract counts
+heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["IgCounts"]] <-
+  list()
+
+for (antigenCategory.tmp in names(heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["IgToPlot"]])) {
+  heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["IgCounts"]][[antigenCategory.tmp]] <-
+    list()
+  for (IgClass.tmp in c("IgA", "IgG")) {
+    data.tmp <-
+      arrayIgNormalizedNsi %>%
+      pivot_wider(
+        id_cols = "donorId",
+        names_from = "antigen",
+        values_from = paste0("valueNormalizedNsi", IgClass.tmp)) %>%
+      as.data.frame() %>%
+      magrittr::set_rownames(.$donorId) %>%
+      dplyr::select(-donorId) %>%
+      as.matrix()
+    heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["IgCounts"]][[antigenCategory.tmp]][[IgClass.tmp]] <-
+      data.tmp[
+        match(heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["sampleOrder"]],
+              rownames(data.tmp)),
+        heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["IgToPlot"]][[antigenCategory.tmp]]] %>%
+      log1p() %>%
+      t()
+  }
+}
+
+# version with counts range01 together for each antigen in IgA and IgG
+heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["IgCountsRange01Joint"]] <- list()
+for (antigenCategory.tmp in names(heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["IgCounts"]])) {
+  countsRange01.tmp <-
+    cbind(heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["IgCounts"]][[antigenCategory.tmp]][["IgA"]],
+          heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["IgCounts"]][[antigenCategory.tmp]][["IgG"]]) %>%
+    apply(MARGIN = 1, range01) %>%
+    t()
+  startIgA.tmp <- 1
+  startIgG.tmp <- 1 + ncol(heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["IgCounts"]][[antigenCategory.tmp]][["IgA"]])
+  heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["IgCountsRange01Joint"]][[antigenCategory.tmp]] <-
+    list(
+      IgA =
+        countsRange01.tmp[, startIgA.tmp:(startIgG.tmp - 1)][
+          , heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory$sampleOrder],
+      IgG =
+        countsRange01.tmp[, startIgG.tmp:ncol(countsRange01.tmp)][
+          , heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory$sampleOrder])
+}
+
+heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["ColorsIgCounts"]] <-
+  colorRampPalette(c("#151B62", "#00BEAE", "#00FF82", "#FFE900"))(101) # blue to green to yellow
+
+heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["ColorsIgCountsRange01"]] <-
+  colorRamp2(
+    breaks = 
+      seq(
+        0, 1, 
+        length.out = 
+          length(heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["ColorsIgCounts"]])),
+    colors =
+      heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["ColorsIgCounts"]])
+
+heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["annotationCols"]] <- list()
+heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["annotationCols"]][["sledaiScore"]] <-
+  colorRampSledaiScore
+
+# specify column annotation
+heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["columnAnno"]] <- list()
+heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["columnAnno"]] <-
+  HeatmapAnnotation(
+    df =
+      arrayIgNormalizedNsi[
+        match(heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["sampleOrder"]],
+              arrayIgNormalizedNsi$donorId),] %>%
+      dplyr::select(sledaiScore),
+    col = 
+      list(
+        sledaiScore =
+          heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["annotationCols"]][["sledaiScore"]]))
+
+# version without column annotation names shown (for combining heatmaps without having labels hidden behind other things)
+heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["columnAnnoHideAnnoNames"]] <-
+  HeatmapAnnotation(
+    df =
+      arrayIgNormalizedNsi[
+        match(heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["sampleOrder"]],
+              arrayIgNormalizedNsi$donorId),] %>%
+      dplyr::select(sledaiScore),
+    col = 
+      list(
+        sledaiScore =
+          heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["annotationCols"]][["sledaiScore"]]),
+    show_annotation_name = FALSE)
+
+rm_tmp(ask = FALSE)
+```
+
+## Heatmaps of SLE-associated autoantibodies, NSI values, for IgA and IgG, with ordering based on similarity of IgA levels (and same dendrogram enforced on IgG heatmap), and ordering of antigens from IgA enforced on IgG
+
+```{r heatmapsSortedCombinedArrangeIgArrayIgNormalizedNsiSleAssociatedByCategoryLogCountsClusterByIgA, dependson=c("heatmapSetupArrayIgNormalizedNsiSleAssociatedByClassAndCategory", "setUtswHeatmapSubjectLabelsSle")}
+# manuscript Figure 1A, Figure S1A
+heatmapsSortedCombinedArrangeIgArrayIgNormalizedNsiSleAssociatedByCategoryLogCountsClusterByIgA <- list()
+for (antigenCategory.tmp in names(heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["IgCounts"]])) {
+  heatmapsSortedCombinedArrangeIgArrayIgNormalizedNsiSleAssociatedByCategoryLogCountsClusterByIgA[[antigenCategory.tmp]] <- list() 
+  
+  # generate IgA heatmap with columns clustered
+  heatmapsSortedCombinedArrangeIgArrayIgNormalizedNsiSleAssociatedByCategoryLogCountsClusterByIgA[[antigenCategory.tmp]][["IgA"]] <-
+    Heatmap(
+      heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["IgCountsRange01Joint"]][[antigenCategory.tmp]][["IgA"]],
+      name = paste("Ig", "level\nlog scaled 0-to-1"),
+      col = heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["ColorsIgCountsRange01"]],
+      cluster_columns = TRUE,
+      cluster_rows = TRUE,
+      row_names_gp = gpar(fontsize = 9),
+      clustering_distance_columns = "euclidean",
+      top_annotation = heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["columnAnnoHideAnnoNames"]],
+      column_title = "IgA",
+      show_column_names = TRUE,
+      show_row_names = FALSE)
+
+  # generate IgG heatmap with columns clustered as in IgA
+  heatmapsSortedCombinedArrangeIgArrayIgNormalizedNsiSleAssociatedByCategoryLogCountsClusterByIgA[[antigenCategory.tmp]][["IgG"]] <- list()
+  heatmapsSortedCombinedArrangeIgArrayIgNormalizedNsiSleAssociatedByCategoryLogCountsClusterByIgA[[antigenCategory.tmp]][["IgG"]] <-
+    Heatmap(
+      heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["IgCountsRange01Joint"]][[antigenCategory.tmp]][["IgG"]],
+      name = paste("Ig", "level\nlog scaled 0-to-1"),
+      col = heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["ColorsIgCountsRange01"]],
+      # use dendrogram from the IgA heatmap
+      cluster_columns = 
+        column_dend(
+          heatmapsSortedCombinedArrangeIgArrayIgNormalizedNsiSleAssociatedByCategoryLogCountsClusterByIgA[[antigenCategory.tmp]][["IgA"]]),
+      cluster_rows =
+        row_dend(
+            heatmapsSortedCombinedArrangeIgArrayIgNormalizedNsiSleAssociatedByCategoryLogCountsClusterByIgA[[antigenCategory.tmp]][["IgA"]]),
+      row_names_gp = gpar(fontsize = 9),
+      clustering_distance_columns = "euclidean",
+      top_annotation = 
+        heatmapParamsArrayIgNormalizedNsiSleAssociatedByClassAndCategory[["columnAnnoHideAnnoNames"]],
+      column_title = "IgG",
+      show_column_names = TRUE,
+      show_row_names = FALSE)
+
+  # generate combined heatmap
+  heatmapsSortedCombinedArrangeIgArrayIgNormalizedNsiSleAssociatedByCategoryLogCountsClusterByIgA[[antigenCategory.tmp]][["combined"]] <-
+    heatmapsSortedCombinedArrangeIgArrayIgNormalizedNsiSleAssociatedByCategoryLogCountsClusterByIgA[[antigenCategory.tmp]][["IgA"]] +
+    heatmapsSortedCombinedArrangeIgArrayIgNormalizedNsiSleAssociatedByCategoryLogCountsClusterByIgA[[antigenCategory.tmp]][["IgG"]]
+  
+  # output combined heatmap
+  pdf(
+    file.path(
+      dirPlots, 
+      paste("heatmapsSortedCombinedArrangeIgArrayIgNormalizedNsiSleAssociatedByCategoryLogCountsClusterByIgA",
+            antigenCategory.tmp, "Combined",
+            filenameSuffix, "pdf", sep = ".")),
+    height = switch(antigenCategory.tmp,
+                    "DNA" = 4.5, "RNA" = 6),
+    width = 14)
+  print(heatmapsSortedCombinedArrangeIgArrayIgNormalizedNsiSleAssociatedByCategoryLogCountsClusterByIgA[[antigenCategory.tmp]][["combined"]])
+  invisible(dev.off())
+}
+
+rm_tmp(ask = FALSE)
+```
+
+# Output R session information
+
+```{r output_session_info, cache=FALSE}
+miscHelpers::print_session_info()
+```
